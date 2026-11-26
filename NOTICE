@@ -1,0 +1,70 @@
+allnodes-xdp
+Copyright 2026 Allnodes
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE), except for
+the eBPF dispatcher program described below, which is licensed under the GNU General
+Public License, version 2 (LICENSE-GPL-2.0).
+
+-------------------------------------------------------------------------------
+Agave (https://github.com/anza-xyz/agave), Apache License, Version 2.0
+-------------------------------------------------------------------------------
+
+The following files are derived from Agave's `xdp`, `xdp-ebpf` and `cpu-utils` crates
+and have been changed by Allnodes; each carries a notice saying so:
+
+  src/device.rs, src/ecn_codepoint.rs, src/gre/mod.rs, src/gre/packet.rs, src/lpm.rs,
+  src/neighbors.rs, src/netlink.rs, src/packet.rs, src/program.rs, src/route.rs,
+  src/route_monitor.rs, src/socket.rs, src/transmitter.rs, src/tx_loop.rs, src/umem.rs,
+  src/cpu_affinity.rs, the interface-address helpers in src/lib.rs,
+  ebpf/src/bin/allnodes-xdp-classifier.rs,
+  tests/netlink_snapshot.rs, tests/route_monitor.rs, tests/router_snapshot.rs,
+  tests/transmitter_smoke.rs, tests/netns/mod.rs, tests/README-netns.md
+
+Agave ships no NOTICE file of its own.
+
+-------------------------------------------------------------------------------
+libxdp (xdp-tools, https://github.com/xdp-project/xdp-tools)
+-------------------------------------------------------------------------------
+
+ebpf/src/bin/allnodes-xdp-dispatcher.rs is a Rust translation of
+lib/libxdp/xdp-dispatcher.c.in (SPDX-License-Identifier: GPL-2.0), changed by Allnodes
+in 2026. That source file and the object built from it, objects/allnodes-xdp-dispatcher,
+are licensed under the GNU General Public License, version 2 (LICENSE-GPL-2.0). The
+object is loaded into the kernel as a separate program; it is not linked with the rest
+of this library. Its complete corresponding source is ebpf/, and scripts/build-ebpf.sh
+rebuilds it.
+
+src/dispatcher.rs mirrors the dispatcher configuration layout of
+headers/xdp/prog_dispatcher.h (SPDX-License-Identifier: GPL-2.0-or-later OR
+BSD-2-Clause), and the BTF lookup in src/bpf_sys.rs mirrors find_prog_btf_id from
+lib/libxdp/libxdp.c (SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause,
+Copyright (C) 2020 Toke Høiland-Jørgensen). Both are used under the BSD-2-Clause
+license:
+
+  Redistribution and use in source and binary forms, with or without modification, are
+  permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice, this list
+     of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice, this
+     list of conditions and the following disclaimer in the documentation and/or other
+     materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+  SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+  TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+  BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY
+  WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+  DAMAGE.
+
+-------------------------------------------------------------------------------
+Linux UAPI
+-------------------------------------------------------------------------------
+
+Structure layouts for netlink, ethtool, AF_XDP and bpf(2) follow the Linux kernel's
+user-space API headers, which carry the Linux-syscall-note exception to the GPL.

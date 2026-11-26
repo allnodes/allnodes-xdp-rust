@@ -1,0 +1,1316 @@
+// Derived from Agave's `xdp` crate (https://github.com/anza-xyz/agave, Apache-2.0);
+// changed by Allnodes. See NOTICE.
+#![allow(clippy::arithmetic_side_effects)]
+
+use {
+    libc::{
+        AF_INET, AF_INET6, AF_NETLINK, IFLA_INFO_DATA, IFLA_INFO_KIND, IFLA_LINKINFO, MSG_DONTWAIT,
+        MSG_TRUNC, NDA_DST, NDA_LLADDR, NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, NETLINK_ROUTE,
+        NLA_ALIGNTO, NLA_TYPE_MASK, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MULTI, NLM_F_REQUEST,
+        NLMSG_DONE, NLMSG_ERROR, RTA_DST, RTA_GATEWAY, RTA_IIF, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY,
+        RTA_TABLE, RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWLINK, RTM_NEWNEIGH,
+        RTM_NEWROUTE, SO_RCVBUF, SOCK_RAW, SOL_NETLINK, SOL_SOCKET, nlattr, nlmsgerr, nlmsghdr,
+        recv, send, setsockopt, sockaddr_nl, socket,
+    },
+    std::{
+        collections::HashMap,
+        ffi::CStr,
+        io, mem,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        ptr, slice,
+    },
+    thiserror::Error,
+};
+
+const NETLINK_RCVBUF_SIZE: i32 = 1 << 16;
+const NLA_HDR_LEN: usize = align_to(mem::size_of::<nlattr>(), NLA_ALIGNTO as usize);
+
+// MTU of the device (from include/uapi/linux/if_link.h)
+const IFLA_MTU: u16 = 4;
+
+const NDA_FLAGS_EXT: u16 = 15;
+const NLM_F_ACK: u16 = 0x4;
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_CREATE: u16 = 0x400;
+const NTF_EXT_LEARNED: u8 = 1 << 4;
+const NTF_EXT_MANAGED: u32 = 1;
+const NTF_EXT_VALIDATED: u32 = 1 << 2;
+const NTF_USE: u8 = 1;
+// GRE nested attributes (from include/uapi/linux/if_tunnel.h)
+const IFLA_XDP: u16 = 43;
+const IFLA_XDP_FD: u16 = 1;
+const IFLA_XDP_ATTACHED: u16 = 2;
+const IFLA_XDP_FLAGS: u16 = 3;
+const IFLA_XDP_PROG_ID: u16 = 4;
+const IFLA_XDP_EXPECTED_FD: u16 = 8;
+const NLA_F_NESTED: u16 = 0x8000;
+const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1 << 0;
+const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
+const XDP_FLAGS_DRV_MODE: u32 = 1 << 2;
+const XDP_FLAGS_REPLACE: u32 = 1 << 4;
+const XDP_ATTACHED_SKB: u8 = 2;
+
+const IFLA_GRE_LOCAL: u16 = 6;
+const IFLA_GRE_REMOTE: u16 = 7;
+const IFLA_GRE_TTL: u16 = 8;
+const IFLA_GRE_TOS: u16 = 9;
+const IFLA_GRE_PMTUDISC: u16 = 10;
+
+// VLAN nested attributes (from include/uapi/linux/if_link.h)
+const IFLA_VLAN_ID: u16 = 1;
+const IFLA_VLAN_PROTOCOL: u16 = 5;
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct ifinfomsg {
+    ifi_family: u8,
+    __ifi_pad: u8,
+    ifi_type: u16,
+    ifi_index: u32,
+    ifi_flags: u32,
+    ifi_change: u32,
+}
+
+pub struct NetlinkSocket {
+    sock: OwnedFd,
+    _nl_pid: u32,
+}
+
+impl NetlinkSocket {
+    pub(crate) fn open() -> Result<Self, io::Error> {
+        // Safety: libc wrapper
+        let sock = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
+        if sock < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `socket` returns a file descriptor.
+        let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+
+        let enable = 1i32;
+        for opt in [NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK] {
+            // Safety: libc wrapper
+            if unsafe {
+                setsockopt(
+                    sock.as_raw_fd(),
+                    SOL_NETLINK,
+                    opt,
+                    &enable as *const _ as *const _,
+                    mem::size_of::<i32>() as u32,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self { sock, _nl_pid: 0 })
+    }
+
+    fn send(&self, msg: &[u8]) -> Result<(), io::Error> {
+        if unsafe {
+            send(
+                self.sock.as_raw_fd(),
+                msg.as_ptr() as *const _,
+                msg.len(),
+                0,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recv(&self) -> Result<Vec<NetlinkMessage>, io::Error> {
+        self.recv_with_flags(0)
+    }
+
+    pub(crate) fn recv_nonblocking(&self) -> Result<Option<Vec<NetlinkMessage>>, io::Error> {
+        match self.recv_with_flags(MSG_DONTWAIT) {
+            Ok(messages) => Ok(Some(messages)),
+            Err(e)
+                if e.raw_os_error()
+                    .is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn recv_with_flags(&self, flags: i32) -> Result<Vec<NetlinkMessage>, io::Error> {
+        // The kernel returns NLMSG_GOODSIZE (8k) as the recommended max allocation for netlink
+        // responses. However that is not a hard cap, and netlink code can in theory return larger
+        // messages. Out of caution we allocate a larger buffer AND use MSG_TRUNC to detect if that
+        // is still not enough.
+        let mut buf = [0u8; 8 * 1024]; // 8 KiB
+        let mut messages = Vec::new();
+        let mut multipart = true;
+        'out: while multipart {
+            multipart = false;
+            // Safety: libc wrapper
+            let len = unsafe {
+                recv(
+                    self.sock.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    flags | MSG_TRUNC,
+                )
+            };
+            if len < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if len == 0 {
+                break;
+            }
+
+            let len = len as usize;
+            if len > buf.len() {
+                return Err(io::Error::other("netlink datagram truncated"));
+            }
+            let mut offset = 0;
+            while offset < len {
+                let message = NetlinkMessage::read(&buf[offset..])?;
+                offset += align_to(message.header.nlmsg_len as usize, NLMSG_ALIGNTO as usize);
+                multipart = message.header.nlmsg_flags & NLM_F_MULTI as u16 != 0;
+                if message.header.nlmsg_flags & NLM_F_DUMP_INTR as u16 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "netlink dump interrupted",
+                    ));
+                }
+                match message.header.nlmsg_type as i32 {
+                    NLMSG_ERROR => {
+                        let err = message.error.unwrap();
+                        if err.error == 0 {
+                            // this is an ACK
+                            continue;
+                        }
+                        return Err(io::Error::from_raw_os_error(-err.error));
+                    }
+                    NLMSG_DONE => break 'out,
+                    _ => messages.push(message),
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
+    /// Opens a listener socket for netlink updates
+    /// NETLINK_ROUTE socket subscribed to `groups` bitmask
+    pub fn bind(groups: u32) -> Result<Self, io::Error> {
+        let sock = Self::open()?;
+
+        // Subscribe to multicast groups
+        let mut addr: sockaddr_nl = unsafe { mem::zeroed() };
+        addr.nl_family = AF_NETLINK as u16;
+        addr.nl_groups = groups;
+        if unsafe {
+            libc::bind(
+                sock.as_raw_fd(),
+                &addr as *const _ as *const _,
+                mem::size_of::<sockaddr_nl>() as u32,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        unsafe {
+            setsockopt(
+                sock.as_raw_fd(),
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &NETLINK_RCVBUF_SIZE as *const _ as *const _,
+                mem::size_of::<i32>() as u32,
+            );
+        }
+
+        Ok(sock)
+    }
+
+    #[inline]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.sock.as_raw_fd()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetlinkMessage {
+    pub(crate) header: nlmsghdr,
+    data: Vec<u8>,
+    error: Option<nlmsgerr>,
+}
+
+impl NetlinkMessage {
+    fn read(buf: &[u8]) -> Result<Self, io::Error> {
+        if mem::size_of::<nlmsghdr>() > buf.len() {
+            return Err(io::Error::other("buffer smaller than nlmsghdr"));
+        }
+
+        // Safety: nlmsghdr is POD so read is safe
+        let header = unsafe { ptr::read_unaligned(buf.as_ptr() as *const nlmsghdr) };
+        let msg_len = header.nlmsg_len as usize;
+        if msg_len < mem::size_of::<nlmsghdr>() || msg_len > buf.len() {
+            return Err(io::Error::other("invalid nlmsg_len"));
+        }
+
+        let data_offset = align_to(mem::size_of::<nlmsghdr>(), NLMSG_ALIGNTO as usize);
+        if data_offset >= buf.len() {
+            return Err(io::Error::other("need more data"));
+        }
+
+        let (data, error) = if header.nlmsg_type == NLMSG_ERROR as u16 {
+            if data_offset + mem::size_of::<nlmsgerr>() > buf.len() {
+                return Err(io::Error::other(
+                    "NLMSG_ERROR but not enough space for nlmsgerr",
+                ));
+            }
+            (
+                Vec::new(),
+                // Safety: nlmsgerr is POD so read is safe
+                Some(unsafe {
+                    ptr::read_unaligned(buf[data_offset..].as_ptr() as *const nlmsgerr)
+                }),
+            )
+        } else {
+            (buf[data_offset..msg_len].to_vec(), None)
+        };
+
+        Ok(Self {
+            header,
+            data,
+            error,
+        })
+    }
+}
+
+const fn align_to(v: usize, align: usize) -> usize {
+    (v + (align - 1)) & !(align - 1)
+}
+
+struct NlAttrsIterator<'a> {
+    attrs: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> NlAttrsIterator<'a> {
+    fn new(attrs: &'a [u8]) -> Self {
+        Self { attrs, offset: 0 }
+    }
+}
+
+impl<'a> Iterator for NlAttrsIterator<'a> {
+    type Item = Result<NlAttr<'a>, NlAttrError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let buf = &self.attrs[self.offset..];
+        if buf.is_empty() {
+            return None;
+        }
+
+        if NLA_HDR_LEN > buf.len() {
+            self.offset = buf.len();
+            return Some(Err(NlAttrError::InvalidBufferLength {
+                size: buf.len(),
+                expected: NLA_HDR_LEN,
+            }));
+        }
+
+        let attr = unsafe { ptr::read_unaligned(buf.as_ptr() as *const nlattr) };
+        let len = attr.nla_len as usize;
+        let align_len = align_to(len, NLA_ALIGNTO as usize);
+        if len < NLA_HDR_LEN {
+            return Some(Err(NlAttrError::InvalidHeaderLength(len)));
+        }
+        if align_len > buf.len() {
+            return Some(Err(NlAttrError::InvalidBufferLength {
+                size: buf.len(),
+                expected: align_len,
+            }));
+        }
+
+        let data = &buf[NLA_HDR_LEN..len];
+
+        self.offset += align_len;
+        Some(Ok(NlAttr { header: attr, data }))
+    }
+}
+
+fn parse_attrs(buf: &[u8]) -> Result<HashMap<u16, NlAttr<'_>>, NlAttrError> {
+    let mut attrs = HashMap::new();
+    for attr in NlAttrsIterator::new(buf) {
+        let attr = attr?;
+        attrs.insert(attr.header.nla_type & NLA_TYPE_MASK as u16, attr);
+    }
+    Ok(attrs)
+}
+
+#[derive(Clone)]
+struct NlAttr<'a> {
+    header: nlattr,
+    data: &'a [u8],
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum NlAttrError {
+    #[error("invalid buffer size `{size}`, expected `{expected}`")]
+    InvalidBufferLength { size: usize, expected: usize },
+
+    #[error("invalid nlattr header length `{0}`")]
+    InvalidHeaderLength(usize),
+}
+
+impl From<NlAttrError> for io::Error {
+    fn from(e: NlAttrError) -> Self {
+        Self::other(e)
+    }
+}
+
+fn bytes_of<T>(val: &T) -> &[u8] {
+    let size = mem::size_of::<T>();
+    unsafe { slice::from_raw_parts(slice::from_ref(val).as_ptr().cast(), size) }
+}
+
+const NLMSG_ALIGNTO: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacAddress(pub [u8; 6]);
+
+impl MacAddress {
+    pub fn new(bytes: [u8; 6]) -> Self {
+        MacAddress(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 6] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+/// GRE tunnel information from netlink
+///
+/// Note: Only supports basic GRE header (no optional fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GreTunnelInfo {
+    /// Source IP address for the GRE tunnel header
+    pub local: IpAddr,
+    /// Destination IP address for the GRE tunnel header
+    pub remote: IpAddr,
+    pub ttl: u8,
+    pub tos: u8,
+    /// PMTU discovery setting (IFLA_GRE_PMTUDISC)
+    pub pmtudisc: u8,
+}
+
+/// 802.1Q VLAN sub-interface information from netlink (IFLA_LINKINFO kind "vlan").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VlanLinkInfo {
+    /// VLAN ID (IFLA_VLAN_ID), 1-4094 in practice.
+    pub vid: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceInfo {
+    pub if_index: u32,
+    pub mtu: u32,
+    pub gre_tunnel: Option<GreTunnelInfo>,
+    pub vlan_link: Option<VlanLinkInfo>,
+}
+
+impl InterfaceInfo {
+    pub fn is_gre(&self) -> bool {
+        self.gre_tunnel.is_some()
+    }
+}
+
+#[repr(C)]
+struct InterfaceRequest {
+    header: nlmsghdr,
+    ifi: ifinfomsg,
+}
+
+pub fn netlink_get_interfaces(family: u8) -> Result<Vec<InterfaceInfo>, io::Error> {
+    let sock = NetlinkSocket::open()?;
+
+    // Safety: ifinfomsg is POD
+    let mut req = unsafe { mem::zeroed::<InterfaceRequest>() };
+
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+
+    req.ifi.ifi_family = family;
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+
+    let mut interfaces = Vec::new();
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWLINK {
+            continue;
+        }
+
+        if let Some(if_info) = parse_rtm_ifinfomsg(&msg) {
+            interfaces.push(if_info);
+        }
+    }
+
+    Ok(interfaces)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct XdpAttachment {
+    pub prog_id: u32,
+    pub drv: bool,
+}
+
+pub fn xdp_attachment(if_index: u32) -> Result<Option<XdpAttachment>, io::Error> {
+    let sock = NetlinkSocket::open()?;
+    let mut req = unsafe { mem::zeroed::<InterfaceRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWLINK || msg.data.len() < mem::size_of::<ifinfomsg>() {
+            continue;
+        }
+        let ifi = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifinfomsg) };
+        if ifi.ifi_index != if_index {
+            continue;
+        }
+        let Ok(attrs) = parse_attrs(&msg.data[mem::size_of::<ifinfomsg>()..]) else {
+            return Ok(None);
+        };
+        let Some(xdp) = attrs.get(&IFLA_XDP) else {
+            return Ok(None);
+        };
+        let Ok(nested) = parse_attrs(xdp.data) else {
+            return Ok(None);
+        };
+        let Some(prog_id) = nested
+            .get(&IFLA_XDP_PROG_ID)
+            .and_then(|a| a.data.get(..4))
+            .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+            .filter(|id| *id != 0)
+        else {
+            return Ok(None);
+        };
+        let drv = nested
+            .get(&IFLA_XDP_ATTACHED)
+            .and_then(|a| a.data.first().copied())
+            .map(|mode| mode != XDP_ATTACHED_SKB)
+            .unwrap_or(true);
+        return Ok(Some(XdpAttachment { prog_id, drv }));
+    }
+    Ok(None)
+}
+
+const DUMP_ATTEMPTS: usize = 3;
+
+pub fn xdp_attachments() -> Result<Vec<(u32, XdpAttachment)>, io::Error> {
+    retry_interrupted(DUMP_ATTEMPTS, dump_attachments)
+}
+
+fn retry_interrupted<T>(attempts: usize, mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut left = attempts.max(1);
+    loop {
+        left -= 1;
+        match f() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && left > 0 => {}
+            other => return other,
+        }
+    }
+}
+
+fn dump_attachments() -> Result<Vec<(u32, XdpAttachment)>, io::Error> {
+    let sock = NetlinkSocket::open()?;
+    let mut req = unsafe { mem::zeroed::<InterfaceRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+
+    let mut out = Vec::new();
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWLINK || msg.data.len() < mem::size_of::<ifinfomsg>() {
+            continue;
+        }
+        let ifi = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifinfomsg) };
+        if let Some(att) = parse_xdp(&msg.data[mem::size_of::<ifinfomsg>()..]) {
+            out.push((ifi.ifi_index, att));
+        }
+    }
+    Ok(out)
+}
+
+fn parse_xdp(link_attrs: &[u8]) -> Option<XdpAttachment> {
+    let attrs = parse_attrs(link_attrs).ok()?;
+    let nested = parse_attrs(attrs.get(&IFLA_XDP)?.data).ok()?;
+    let prog_id = nested
+        .get(&IFLA_XDP_PROG_ID)
+        .and_then(|a| a.data.get(..4))
+        .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .filter(|id| *id != 0)?;
+    let drv = nested
+        .get(&IFLA_XDP_ATTACHED)
+        .and_then(|a| a.data.first().copied())
+        .map(|mode| mode != XDP_ATTACHED_SKB)
+        .unwrap_or(true);
+    Some(XdpAttachment { prog_id, drv })
+}
+
+pub fn xdp_prog_id(if_index: u32) -> Result<Option<u32>, io::Error> {
+    Ok(xdp_attachment(if_index)?.map(|a| a.prog_id))
+}
+
+pub fn netlink_attach_xdp(
+    if_index: u32,
+    prog_fd: RawFd,
+    drv: bool,
+    expected: Option<RawFd>,
+) -> io::Result<()> {
+    let mode = if drv {
+        XDP_FLAGS_DRV_MODE
+    } else {
+        XDP_FLAGS_SKB_MODE
+    };
+    match expected {
+        None => netlink_set_xdp(if_index, prog_fd, mode | XDP_FLAGS_UPDATE_IF_NOEXIST, None),
+        Some(old) => netlink_set_xdp(if_index, prog_fd, mode | XDP_FLAGS_REPLACE, Some(old)),
+    }
+}
+
+pub fn netlink_detach_xdp(if_index: u32, drv: bool) -> io::Result<()> {
+    let mode = if drv { XDP_FLAGS_DRV_MODE } else { XDP_FLAGS_SKB_MODE };
+    netlink_set_xdp(if_index, -1, mode, None)
+}
+
+pub fn netlink_detach_xdp_expected(if_index: u32, drv: bool, expected: RawFd) -> io::Result<()> {
+    let mode = if drv {
+        XDP_FLAGS_DRV_MODE
+    } else {
+        XDP_FLAGS_SKB_MODE
+    };
+    netlink_set_xdp(if_index, -1, mode | XDP_FLAGS_REPLACE, Some(expected))
+}
+
+fn get_link(if_index: u32) -> io::Result<NetlinkMessage> {
+    let sock = NetlinkSocket::open()?;
+    // Safety: ifinfomsg is POD
+    let mut req = unsafe { mem::zeroed::<InterfaceRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: NLM_F_REQUEST as u16,
+        nlmsg_type: RTM_GETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.ifi.ifi_index = if_index;
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    sock.recv()?
+        .into_iter()
+        .find(|m| m.header.nlmsg_type == RTM_NEWLINK)
+        .ok_or_else(|| io::Error::other(format!("no link reply for interface index {if_index}")))
+}
+
+const IFLA_IFNAME: u16 = 3;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_LOWER_UP: u32 = 0x10000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkInfo {
+    pub if_index: u32,
+    pub name: String,
+    pub kind: Option<String>,
+    pub flags: u32,
+}
+
+impl LinkInfo {
+    pub fn is_loopback(&self) -> bool {
+        self.flags & IFF_LOOPBACK != 0
+    }
+
+    pub fn carrier(&self) -> bool {
+        self.flags & IFF_LOWER_UP != 0
+    }
+}
+
+fn parse_link_info(msg: &NetlinkMessage) -> io::Result<Option<LinkInfo>> {
+    if msg.header.nlmsg_type != RTM_NEWLINK {
+        return Ok(None);
+    }
+    if msg.data.len() < mem::size_of::<ifinfomsg>() {
+        return Err(io::Error::other("link reply shorter than ifinfomsg"));
+    }
+    let ifi = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifinfomsg) };
+    let attrs = parse_attrs(&msg.data[mem::size_of::<ifinfomsg>()..])?;
+    let name = match attrs.get(&IFLA_IFNAME) {
+        Some(a) => CStr::from_bytes_until_nul(a.data)
+            .map_err(|e| io::Error::other(format!("link name is not a C string: {e}")))?
+            .to_string_lossy()
+            .into_owned(),
+        None => {
+            return Err(io::Error::other(format!(
+                "link {} has no name",
+                ifi.ifi_index
+            )));
+        }
+    };
+    let kind = match attrs.get(&IFLA_LINKINFO) {
+        Some(li) => match parse_attrs(li.data)?.get(&IFLA_INFO_KIND) {
+            Some(k) => Some(
+                CStr::from_bytes_until_nul(k.data)
+                    .map_err(|e| io::Error::other(format!("link kind is not a C string: {e}")))?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            None => None,
+        },
+        None => None,
+    };
+    Ok(Some(LinkInfo {
+        if_index: ifi.ifi_index,
+        name,
+        kind,
+        flags: ifi.ifi_flags,
+    }))
+}
+
+pub fn netlink_get_links() -> io::Result<Vec<LinkInfo>> {
+    let sock = NetlinkSocket::open()?;
+    // Safety: ifinfomsg is POD
+    let mut req = unsafe { mem::zeroed::<InterfaceRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.ifi.ifi_family = AF_INET as u8;
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    let mut out = Vec::new();
+    for msg in sock.recv()? {
+        if let Some(link) = parse_link_info(&msg)? {
+            out.push(link);
+        }
+    }
+    Ok(out)
+}
+
+pub fn link_kind(if_index: u32) -> io::Result<Option<String>> {
+    let msg = get_link(if_index)?;
+    let body = msg
+        .data
+        .get(mem::size_of::<ifinfomsg>()..)
+        .ok_or_else(|| io::Error::other("link reply shorter than ifinfomsg"))?;
+    let attrs = parse_attrs(body)?;
+    let Some(li) = attrs.get(&IFLA_LINKINFO) else {
+        return Ok(None);
+    };
+    let info = parse_attrs(li.data)?;
+    let Some(kind) = info.get(&IFLA_INFO_KIND) else {
+        return Ok(None);
+    };
+    let kind = CStr::from_bytes_until_nul(kind.data)
+        .map_err(|e| io::Error::other(format!("link kind is not a C string: {e}")))?;
+    Ok(Some(kind.to_string_lossy().into_owned()))
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct ifaddrmsg {
+    ifa_family: u8,
+    ifa_prefixlen: u8,
+    ifa_flags: u8,
+    ifa_scope: u8,
+    ifa_index: u32,
+}
+
+#[repr(C)]
+struct AddrRequest {
+    header: nlmsghdr,
+    ifa: ifaddrmsg,
+}
+
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+
+pub fn netlink_get_ipv4_addrs() -> io::Result<Vec<(u32, Ipv4Addr)>> {
+    let sock = NetlinkSocket::open()?;
+    let mut req = unsafe { mem::zeroed::<AddrRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifaddrmsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETADDR,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.ifa.ifa_family = AF_INET as u8;
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    let mut out = Vec::new();
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWADDR {
+            continue;
+        }
+        if msg.data.len() < mem::size_of::<ifaddrmsg>() {
+            return Err(io::Error::other("address reply shorter than ifaddrmsg"));
+        }
+        let ifa = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifaddrmsg) };
+        if ifa.ifa_family != AF_INET as u8 {
+            continue;
+        }
+        let attrs = parse_attrs(&msg.data[mem::size_of::<ifaddrmsg>()..])?;
+        let addr = attrs
+            .get(&IFA_LOCAL)
+            .or_else(|| attrs.get(&IFA_ADDRESS))
+            .and_then(|a| parse_ip_address(a.data, AF_INET as u8));
+        if let Some(IpAddr::V4(ip)) = addr
+            && !out.contains(&(ifa.ifa_index, ip))
+        {
+            out.push((ifa.ifa_index, ip));
+        }
+    }
+    Ok(out)
+}
+
+pub fn ipv4_addrs(if_index: u32) -> io::Result<Vec<Ipv4Addr>> {
+    let sock = NetlinkSocket::open()?;
+    let mut req = unsafe { mem::zeroed::<AddrRequest>() };
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifaddrmsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETADDR,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.ifa.ifa_family = AF_INET as u8;
+    req.ifa.ifa_index = if_index;
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    let mut out = Vec::new();
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWADDR || msg.data.len() < mem::size_of::<ifaddrmsg>() {
+            continue;
+        }
+        let ifa = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifaddrmsg) };
+        if ifa.ifa_index != if_index || ifa.ifa_family != AF_INET as u8 {
+            continue;
+        }
+        let attrs = parse_attrs(&msg.data[mem::size_of::<ifaddrmsg>()..])?;
+        let addr = attrs
+            .get(&IFA_LOCAL)
+            .or_else(|| attrs.get(&IFA_ADDRESS))
+            .and_then(|a| parse_ip_address(a.data, AF_INET as u8));
+        if let Some(IpAddr::V4(ip)) = addr
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    Ok(out)
+}
+
+fn netlink_set_xdp(
+    if_index: u32,
+    prog_fd: RawFd,
+    flags: u32,
+    expected_fd: Option<RawFd>,
+) -> io::Result<()> {
+    let sock = NetlinkSocket::open()?;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    buf.extend_from_slice(&0u32.to_ne_bytes());
+    buf.extend_from_slice(&libc::RTM_SETLINK.to_ne_bytes());
+    buf.extend_from_slice(&((NLM_F_REQUEST | libc::NLM_F_ACK) as u16).to_ne_bytes());
+    buf.extend_from_slice(&1u32.to_ne_bytes());
+    buf.extend_from_slice(&0u32.to_ne_bytes());
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&0u16.to_ne_bytes());
+    buf.extend_from_slice(&(if_index as i32).to_ne_bytes());
+    buf.extend_from_slice(&0u32.to_ne_bytes());
+    buf.extend_from_slice(&0u32.to_ne_bytes());
+    let nest = buf.len();
+    buf.extend_from_slice(&0u16.to_ne_bytes());
+    buf.extend_from_slice(&(IFLA_XDP | NLA_F_NESTED).to_ne_bytes());
+    push_nlattr(&mut buf, IFLA_XDP_FD, &prog_fd);
+    push_nlattr(&mut buf, IFLA_XDP_FLAGS, &flags);
+    if let Some(old) = expected_fd {
+        push_nlattr(&mut buf, IFLA_XDP_EXPECTED_FD, &old);
+    }
+    let outer_len = (buf.len() - nest) as u16;
+    buf[nest..nest + 2].copy_from_slice(&outer_len.to_ne_bytes());
+    let total = buf.len() as u32;
+    buf[0..4].copy_from_slice(&total.to_ne_bytes());
+
+    sock.send(&buf)?;
+    sock.recv()?;
+    Ok(())
+}
+
+pub(crate) fn parse_rtm_ifinfomsg(msg: &NetlinkMessage) -> Option<InterfaceInfo> {
+    if msg.data.len() < mem::size_of::<ifinfomsg>() {
+        return None;
+    }
+
+    let ifi = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifinfomsg) };
+    let Ok(attrs) = parse_attrs(&msg.data[mem::size_of::<ifinfomsg>()..]) else {
+        return None;
+    };
+
+    let mtu = attrs
+        .get(&IFLA_MTU)
+        .and_then(|a| u32_from_ne_bytes(a.data))?;
+
+    // Parse GRE tunnel information if this is a GRE interface
+    let gre_tunnel = parse_gre_tunnel_info_from_linkinfo(&attrs);
+    // Parse VLAN information if this is an 802.1Q VLAN sub-interface
+    let vlan_link = parse_vlan_link_info_from_linkinfo(&attrs);
+    Some(InterfaceInfo {
+        if_index: ifi.ifi_index,
+        mtu,
+        gre_tunnel,
+        vlan_link,
+    })
+}
+
+// Parse 802.1Q VLAN information from netlink
+fn parse_vlan_link_info_from_linkinfo(attrs: &HashMap<u16, NlAttr>) -> Option<VlanLinkInfo> {
+    let vlan = parse_linkinfo_data_for_kind(attrs, b"vlan")?;
+
+    // Only 802.1Q is supported; skip 802.1ad (QinQ) sub-interfaces. The protocol attribute is a
+    // big-endian u16; kernels predating 802.1ad support omit it, which implies 802.1Q.
+    if let Some(proto) = vlan.get(&IFLA_VLAN_PROTOCOL) {
+        let proto = u16::from_be_bytes(proto.data.get(..2)?.try_into().ok()?);
+        if proto != libc::ETH_P_8021Q as u16 {
+            return None;
+        }
+    }
+
+    let vid = vlan
+        .get(&IFLA_VLAN_ID)
+        .and_then(|a| u16_from_ne_bytes(a.data))?;
+    Some(VlanLinkInfo { vid })
+}
+
+// Parse GRE tunnel information from netlink
+fn parse_gre_tunnel_info_from_linkinfo(attrs: &HashMap<u16, NlAttr>) -> Option<GreTunnelInfo> {
+    let gre = parse_linkinfo_data_for_kind(attrs, b"gre")?;
+
+    let u8_from_bytes = |data: &[u8]| -> Option<u8> { data.first().copied() };
+
+    let local = gre
+        .get(&IFLA_GRE_LOCAL)
+        .and_then(|a| parse_ip_address(a.data, AF_INET as u8))?;
+    let remote = gre
+        .get(&IFLA_GRE_REMOTE)
+        .and_then(|a| parse_ip_address(a.data, AF_INET as u8))?;
+    let ttl = gre.get(&IFLA_GRE_TTL).and_then(|a| u8_from_bytes(a.data))?;
+    let tos = gre.get(&IFLA_GRE_TOS).and_then(|a| u8_from_bytes(a.data))?;
+    let pmtudisc = gre
+        .get(&IFLA_GRE_PMTUDISC)
+        .and_then(|a| u8_from_bytes(a.data))?;
+
+    Some(GreTunnelInfo {
+        local,
+        remote,
+        ttl,
+        tos,
+        pmtudisc,
+    })
+}
+
+fn parse_linkinfo_data_for_kind<'a>(
+    attrs: &HashMap<u16, NlAttr<'a>>,
+    expected_kind: &[u8],
+) -> Option<HashMap<u16, NlAttr<'a>>> {
+    let li = attrs.get(&IFLA_LINKINFO)?;
+    // IFLA_LINKINFO contains nested attributes
+    let info = parse_attrs(li.data).ok()?;
+    let kind_attr = info.get(&IFLA_INFO_KIND)?;
+    if kind_attr.data.is_empty() {
+        return None;
+    }
+    let kind = CStr::from_bytes_until_nul(kind_attr.data).ok()?;
+    if kind.to_bytes() != expected_kind {
+        return None;
+    }
+    // Nested data (GRE attributes) is optional.
+    let data_attr = info.get(&IFLA_INFO_DATA)?;
+    parse_attrs(data_attr.data).ok()
+}
+
+/// Represents an entry in the neighbor table (ARP/NDP cache)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NeighborEntry {
+    // IPv4 or IPv6 address
+    pub destination: Option<IpAddr>,
+    // MAC address
+    pub lladdr: Option<MacAddress>,
+    // Interface index
+    pub ifindex: i32,
+    // NUD_* state
+    pub state: u16,
+    // NTF_* flags from ndmsg
+    pub flags: u8,
+    // NTF_EXT_* flags from NDA_FLAGS_EXT
+    pub flags_ext: u32,
+}
+
+impl NeighborEntry {
+    #[inline]
+    pub fn key(&self) -> Option<(i32, Ipv4Addr)> {
+        match self.destination {
+            Some(IpAddr::V4(ip)) => Some((self.ifindex, ip)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn requires_refresh(&self) -> bool {
+        self.state & (libc::NUD_PERMANENT | libc::NUD_NOARP) == 0
+            && self.flags & NTF_EXT_LEARNED == 0
+            && self.flags_ext & (NTF_EXT_MANAGED | NTF_EXT_VALIDATED) == 0
+    }
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct ndmsg {
+    ndm_family: u8,
+    _ndm_pad1: u8,
+    _ndm_pad2: u16,
+    ndm_ifindex: i32,
+    ndm_state: u16,
+    ndm_flags: u8,
+    _ndm_type: u8,
+}
+
+#[repr(C)]
+struct NeighRequest {
+    header: nlmsghdr,
+    ndm: ndmsg,
+}
+
+pub fn netlink_use_neighbor(
+    sock: &NetlinkSocket,
+    if_index: u32,
+    ip: Ipv4Addr,
+) -> Result<(), io::Error> {
+    let req = {
+        // Safety: NeighRequest is POD.
+        let mut req = unsafe { mem::zeroed::<NeighRequest>() };
+        let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ndmsg>();
+        req.header = nlmsghdr {
+            nlmsg_len: nlmsg_len as u32,
+            nlmsg_flags: (NLM_F_REQUEST as u16) | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+            nlmsg_type: RTM_NEWNEIGH,
+            nlmsg_pid: 0,
+            nlmsg_seq: 1,
+        };
+        req.ndm.ndm_family = AF_INET as u8;
+        req.ndm.ndm_ifindex = if_index as i32;
+        req.ndm.ndm_state = 0;
+        req.ndm.ndm_flags = NTF_USE;
+
+        let mut req_buf = bytes_of(&req)[..nlmsg_len].to_vec();
+        push_nlattr(&mut req_buf, NDA_DST, &ip.octets());
+
+        let header = unsafe { &mut *(req_buf.as_mut_ptr() as *mut nlmsghdr) };
+        header.nlmsg_len = req_buf.len() as u32;
+
+        req_buf
+    };
+    sock.send(&req)?;
+    sock.recv()?;
+    Ok(())
+}
+
+/// fetch the kernel's neighbor table (ARP/NDP cache)
+pub fn netlink_get_neighbors(
+    if_index: Option<u32>,
+    family: u8,
+) -> Result<Vec<NeighborEntry>, io::Error> {
+    let sock = NetlinkSocket::open()?;
+
+    // Safety: NeighRequest is POD
+    let mut req = unsafe { mem::zeroed::<NeighRequest>() };
+
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ndmsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETNEIGH,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+
+    req.ndm.ndm_family = family;
+    if let Some(idx) = if_index {
+        req.ndm.ndm_ifindex = idx as i32;
+    }
+
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+
+    let mut neighbors = Vec::new();
+
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWNEIGH {
+            continue;
+        }
+
+        if msg.data.len() < mem::size_of::<ndmsg>() {
+            continue;
+        }
+
+        if let Some(neighbor) = parse_rtm_newneigh(&msg, if_index) {
+            neighbors.push(neighbor);
+        }
+    }
+
+    Ok(neighbors)
+}
+
+pub fn parse_rtm_newneigh(msg: &NetlinkMessage, if_index: Option<u32>) -> Option<NeighborEntry> {
+    if msg.data.len() < mem::size_of::<ndmsg>() {
+        return None;
+    }
+    let nd_msg = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ndmsg) };
+    if let Some(idx) = if_index
+        && nd_msg.ndm_ifindex != idx as i32
+    {
+        return None;
+    }
+    let Ok(attrs) = parse_attrs(&msg.data[mem::size_of::<ndmsg>()..]) else {
+        return None;
+    };
+    let mut neighbor = NeighborEntry {
+        destination: None,
+        lladdr: None,
+        ifindex: nd_msg.ndm_ifindex,
+        state: nd_msg.ndm_state,
+        flags: nd_msg.ndm_flags,
+        flags_ext: 0,
+    };
+    if let Some(dst_attr) = attrs.get(&NDA_DST) {
+        neighbor.destination = parse_ip_address(dst_attr.data, nd_msg.ndm_family);
+    }
+    if let Some(lladdr_attr) = attrs.get(&NDA_LLADDR)
+        && lladdr_attr.data.len() >= 6
+    {
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&lladdr_attr.data[0..6]);
+        neighbor.lladdr = Some(MacAddress(mac));
+    }
+    if let Some(flags_ext_attr) = attrs.get(&NDA_FLAGS_EXT)
+        && flags_ext_attr.data.len() >= mem::size_of::<u32>()
+    {
+        let mut flags_ext = [0; mem::size_of::<u32>()];
+        flags_ext.copy_from_slice(&flags_ext_attr.data[..mem::size_of::<u32>()]);
+        neighbor.flags_ext = u32::from_ne_bytes(flags_ext);
+    }
+    Some(neighbor)
+}
+
+#[derive(Clone)]
+pub struct RouteEntry {
+    pub destination: Option<IpAddr>,
+    pub gateway: Option<IpAddr>,
+    pub pref_src: Option<IpAddr>,
+    pub out_if_index: Option<i32>,
+    pub in_if_index: Option<i32>,
+    pub priority: Option<u32>,
+    pub table: Option<u32>,
+    pub protocol: u8,
+    pub scope: u8,
+    pub type_: u8,
+    pub family: u8,
+    pub dst_len: u8,
+    pub flags: u32,
+    pub multipath: bool,
+    pub nh_id: bool,
+}
+
+const RTA_MULTIPATH: u16 = 9;
+const RTA_NH_ID: u16 = 30;
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct rtmsg {
+    rtm_family: u8,
+    rtm_dst_len: u8,
+    rtm_src_len: u8,
+    rtm_tos: u8,
+    rtm_table: u8,
+    rtm_protocol: u8,
+    rtm_scope: u8,
+    rtm_type: u8,
+    rtm_flags: u32,
+}
+
+#[repr(C)]
+struct RouteRequest {
+    header: nlmsghdr,
+    rtm: rtmsg,
+}
+
+fn parse_ip_address(data: &[u8], family: u8) -> Option<IpAddr> {
+    match family as i32 {
+        AF_INET if data.len() == 4 => Some(IpAddr::V4(Ipv4Addr::new(
+            data[0], data[1], data[2], data[3],
+        ))),
+        AF_INET6 if data.len() == 16 => {
+            let mut segments = [0u16; 8];
+            for i in 0..8 {
+                segments[i] = ((data[i * 2] as u16) << 8) | (data[i * 2 + 1] as u16);
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(segments)))
+        }
+        _ => None,
+    }
+}
+
+pub fn netlink_get_routes(family: u8, table: u32) -> Result<Vec<RouteEntry>, io::Error> {
+    let sock = NetlinkSocket::open()?;
+
+    // Safety: RouteRequest is POD
+    let mut req = unsafe { mem::zeroed::<RouteRequest>() };
+
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<rtmsg>();
+    let table_attr_len = align_to(NLA_HDR_LEN + mem::size_of::<u32>(), NLA_ALIGNTO as usize);
+    req.header = nlmsghdr {
+        nlmsg_len: (nlmsg_len + table_attr_len) as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_DUMP) as u16,
+        nlmsg_type: RTM_GETROUTE,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+
+    req.rtm.rtm_family = family;
+
+    let mut req_buf = bytes_of(&req)[..nlmsg_len].to_vec();
+    push_nlattr(&mut req_buf, RTA_TABLE, &table);
+    sock.send(&req_buf)?;
+
+    let mut routes = Vec::new();
+
+    for msg in sock.recv()? {
+        if msg.header.nlmsg_type != RTM_NEWROUTE {
+            continue;
+        }
+        if let Some(route) = parse_rtm_newroute(&msg) {
+            // with strict checking, the kernel should return routes for the requested table only
+            debug_assert!(route.table == Some(table));
+            if route.table == Some(table) {
+                routes.push(route);
+            }
+        }
+    }
+
+    Ok(routes)
+}
+
+pub fn parse_rtm_newroute(msg: &NetlinkMessage) -> Option<RouteEntry> {
+    if msg.data.len() < mem::size_of::<rtmsg>() {
+        return None;
+    }
+
+    let rt_msg = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const rtmsg) };
+    let Ok(attrs) = parse_attrs(&msg.data[mem::size_of::<rtmsg>()..]) else {
+        return None;
+    };
+    let mut route = RouteEntry {
+        destination: None,
+        gateway: None,
+        pref_src: None,
+        out_if_index: None,
+        in_if_index: None,
+        priority: None,
+        table: Some(u32::from(rt_msg.rtm_table)),
+        protocol: rt_msg.rtm_protocol,
+        scope: rt_msg.rtm_scope,
+        type_: rt_msg.rtm_type,
+        family: rt_msg.rtm_family,
+        dst_len: rt_msg.rtm_dst_len,
+        flags: rt_msg.rtm_flags,
+        multipath: attrs.contains_key(&RTA_MULTIPATH),
+        nh_id: attrs.contains_key(&RTA_NH_ID),
+    };
+    if let Some(dst_attr) = attrs.get(&RTA_DST) {
+        route.destination = parse_ip_address(dst_attr.data, rt_msg.rtm_family);
+    }
+    if let Some(gateway_attr) = attrs.get(&RTA_GATEWAY) {
+        route.gateway = parse_ip_address(gateway_attr.data, rt_msg.rtm_family);
+    }
+
+    if let Some(oif_attr) = attrs.get(&RTA_OIF) {
+        route.out_if_index = u32_from_ne_bytes(oif_attr.data).map(|i| i as i32);
+    }
+    if let Some(iif_attr) = attrs.get(&RTA_IIF) {
+        route.in_if_index = u32_from_ne_bytes(iif_attr.data).map(|i| i as i32);
+    }
+    if let Some(priority_attr) = attrs.get(&RTA_PRIORITY) {
+        route.priority = u32_from_ne_bytes(priority_attr.data);
+    }
+    if let Some(table_attr) = attrs.get(&RTA_TABLE) {
+        route.table = u32_from_ne_bytes(table_attr.data);
+    }
+    if let Some(prefsrc_attr) = attrs.get(&RTA_PREFSRC) {
+        route.pref_src = parse_ip_address(prefsrc_attr.data, rt_msg.rtm_family);
+    }
+    Some(route)
+}
+
+fn push_nlattr<T>(buf: &mut Vec<u8>, attr_type: u16, value: &T) {
+    let attr_len = NLA_HDR_LEN + mem::size_of::<T>();
+    let aligned_len = align_to(attr_len, NLA_ALIGNTO as usize);
+    let attr = nlattr {
+        nla_len: attr_len as u16,
+        nla_type: attr_type,
+    };
+    buf.extend_from_slice(bytes_of(&attr));
+    buf.extend_from_slice(bytes_of(value));
+    buf.resize(buf.len() + (aligned_len - attr_len), 0);
+}
+
+fn u32_from_ne_bytes(data: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(..4)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(bytes))
+}
+
+fn u16_from_ne_bytes(data: &[u8]) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(..2)?.try_into().ok()?;
+    Some(u16::from_ne_bytes(bytes))
+}

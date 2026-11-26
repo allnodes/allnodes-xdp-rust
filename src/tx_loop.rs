@@ -1,0 +1,821 @@
+// Derived from Agave's `xdp` crate (https://github.com/anza-xyz/agave, Apache-2.0);
+// changed by Allnodes. See NOTICE.
+#![allow(clippy::arithmetic_side_effects)]
+
+use {
+    crate::{
+        device::{DeviceQueue, NetworkDevice, QueueId, RingSizes, TxCompletionRing},
+        ecn_codepoint::EcnCodepoint,
+        gre::{
+            construct_gre_packet, gre_packet_size,
+            packet::{GRE_HEADER_BASE_SIZE, INNER_PACKET_HEADER_SIZE},
+        },
+        netlink::MacAddress,
+        packet::{
+            IP_HEADER_SIZE, PACKET_HEADER_SIZE, UDP_HEADER_SIZE, VLAN_PACKET_HEADER_SIZE,
+            construct_packet, construct_vlan_packet,
+        },
+        route::NextHop,
+        socket::{Socket, Tx, TxRing},
+        umem::{Frame, OwnedUmem, PageAlignedMemory, Umem},
+    },
+    crate::cpu_affinity::set_cpu_affinity,
+    crossbeam_channel::{Receiver, TryRecvError},
+    libc::{_SC_PAGESIZE, sysconf},
+    std::{
+        io,
+        net::{IpAddr, SocketAddr, SocketAddrV4},
+        time::Duration,
+    },
+};
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TxLoopError {
+    #[error("failed to read MAC address of {interface}: {source}")]
+    ReadMacAddress {
+        interface: String,
+        source: io::Error,
+    },
+    #[error("failed to allocate UMEM for {interface} queue {queue_id:?}")]
+    AllocateUmem {
+        interface: String,
+        queue_id: QueueId,
+    },
+    #[error("failed to create AF_XDP TX socket for queue {queue_id:?} on CPU {cpu_id}: {source}")]
+    CreateSocket {
+        queue_id: QueueId,
+        cpu_id: usize,
+        source: io::Error,
+    },
+}
+
+pub struct TxLoopConfigBuilder {
+    zero_copy: bool,
+    maybe_src_mac: Option<MacAddress>,
+}
+
+impl TxLoopConfigBuilder {
+    pub fn new() -> Self {
+        Self {
+            zero_copy: false,
+            maybe_src_mac: None,
+        }
+    }
+
+    pub fn zero_copy(&mut self, enable: bool) -> &mut Self {
+        self.zero_copy = enable;
+        self
+    }
+
+    pub fn override_src_mac(&mut self, mac: MacAddress) -> &mut Self {
+        self.maybe_src_mac = Some(mac);
+        self
+    }
+
+    pub fn build_with_src_device(
+        self,
+        src_device: &NetworkDevice,
+    ) -> Result<TxLoopConfig, TxLoopError> {
+        let Self {
+            zero_copy,
+            maybe_src_mac,
+        } = self;
+
+        // If no source MAC is provided, use the device's MAC address.
+        let src_mac = match maybe_src_mac {
+            Some(src_mac) => src_mac,
+            None => src_device
+                .mac_addr()
+                .map_err(|source| TxLoopError::ReadMacAddress {
+                    interface: src_device.name().to_string(),
+                    source,
+                })?,
+        };
+
+        Ok(TxLoopConfig { zero_copy, src_mac })
+    }
+}
+
+impl Default for TxLoopConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TxLoopConfig {
+    zero_copy: bool,
+    src_mac: MacAddress,
+}
+
+pub struct TxLoopBuilder<U: Umem> {
+    cpu_id: usize,
+    zero_copy: bool,
+    src_mac: MacAddress,
+    queue: DeviceQueue,
+    tx_size: usize,
+    umem: U,
+}
+
+impl TxLoopBuilder<OwnedUmem> {
+    pub fn new(
+        cpu_id: usize,
+        queue_id: QueueId,
+        config: TxLoopConfig,
+        dev: &NetworkDevice,
+    ) -> Result<TxLoopBuilder<OwnedUmem>, TxLoopError> {
+        let TxLoopConfig { zero_copy, src_mac } = config;
+
+        tracing::info!(
+            "starting xdp loop on {} queue {queue_id:?} cpu {cpu_id}",
+            dev.name()
+        );
+
+        // We don't support MTUs larger than page size due to AF_XDP limitations in single-buffer
+        // mode and a possible workaround might be to use multi-buffer TX.
+
+        // some drivers require frame_size=page_size
+        let frame_size = unsafe { sysconf(_SC_PAGESIZE) } as usize;
+
+        let queue = dev.open_queue(queue_id);
+        let ring_sizes = queue.ring_sizes().unwrap_or_else(|| {
+            tracing::info!(
+                "using default ring sizes for {} queue {queue_id:?}",
+                dev.name()
+            );
+            RingSizes::default()
+        });
+
+        // Align the ring sizes reported by buggy drivers. Only in copy mode, where the AF_XDP rings
+        // are decoupled from the hardware rings.
+        let ring_sizes = if zero_copy {
+            ring_sizes
+        } else {
+            let aligned = align_ring_sizes(ring_sizes);
+            if aligned != ring_sizes {
+                tracing::warn!(
+                    "{} queue {queue_id:?} reports ring sizes {ring_sizes:?}, which AF_XDP \
+                     rejects as not a power of two; using {aligned:?}",
+                    dev.name()
+                );
+            }
+            aligned
+        };
+
+        let RingSizes {
+            rx: rx_size,
+            tx: tx_size,
+        } = ring_sizes;
+
+        let frame_count = (rx_size + tx_size) * 2;
+
+        // try to allocate huge pages first, then fall back to regular pages
+        const HUGE_2MB: usize = 2 * 1024 * 1024;
+        let memory =
+            PageAlignedMemory::alloc_with_page_size(frame_size, frame_count, HUGE_2MB, true)
+                .or_else(|_| {
+                    tracing::warn!("huge page alloc failed, falling back to regular page size");
+                    PageAlignedMemory::alloc(frame_size, frame_count)
+                })
+                .map_err(|_| TxLoopError::AllocateUmem {
+                    interface: dev.name().to_string(),
+                    queue_id,
+                })?;
+        let umem = OwnedUmem::new(memory, frame_size as u32);
+
+        Ok(TxLoopBuilder {
+            cpu_id,
+            zero_copy,
+            src_mac,
+            queue,
+            tx_size,
+            umem,
+        })
+    }
+
+    pub fn build(self) -> Result<TxLoop<OwnedUmem>, TxLoopError> {
+        let TxLoopBuilder {
+            cpu_id,
+            zero_copy,
+            src_mac,
+            queue,
+            tx_size,
+            umem,
+        } = self;
+
+        let queue_id = queue.id();
+        let (socket, tx) =
+            Socket::tx(queue, umem, zero_copy, tx_size * 2, tx_size).map_err(|source| {
+                TxLoopError::CreateSocket {
+                    queue_id,
+                    cpu_id,
+                    source,
+                }
+            })?;
+
+        let Tx {
+            // this is where we'll queue frames
+            ring,
+            // this is where we'll get completion events once frames have been picked up by the NIC
+            completion,
+        } = tx;
+        let ring = ring.expect("Socket::tx always creates a TX ring");
+
+        Ok(TxLoop {
+            cpu_id,
+            src_mac,
+            socket,
+            ring,
+            completion,
+        })
+    }
+}
+
+/// Rounds up ring sizes from drivers that report a depth AF_XDP rejects, like bnxt_en's 511. Zero
+/// means "no ring" and is left alone.
+fn align_ring_sizes(RingSizes { rx, tx }: RingSizes) -> RingSizes {
+    fn align(size: usize) -> usize {
+        if size == 0 {
+            0
+        } else {
+            size.next_power_of_two()
+        }
+    }
+
+    RingSizes {
+        rx: align(rx),
+        tx: align(tx),
+    }
+}
+
+pub struct TxLoop<U: Umem> {
+    cpu_id: usize,
+    src_mac: MacAddress,
+    socket: Socket<U>,
+    ring: TxRing<U::Frame>,
+    completion: TxCompletionRing,
+}
+
+/// [`TxPacket`] represents a packet to transmit via XDP to a list of addresses with the provided
+/// `payload` and source address.
+pub trait TxPacket {
+    type Addrs: AsRef<[SocketAddr]>;
+    type Payload: AsRef<[u8]>;
+
+    /// List of destination addresses to which the packet should be sent.
+    fn dst_addrs(&self) -> &Self::Addrs;
+
+    /// Payload of the packet to be sent.
+    fn payload(&self) -> &Self::Payload;
+
+    /// Source address used when sending the packet.
+    fn src_addr(&self) -> SocketAddrV4;
+
+    /// Explicit congestion notification bits to set on the packet.
+    fn ecn(&self) -> Option<EcnCodepoint>;
+
+    /// Returns true when this packet is expected to occasionally exceed the route MTU.
+    fn allow_mtu_overflow(&self) -> bool;
+}
+
+#[derive(Default)]
+struct TxStats {
+    tx: u64,
+    drop_no_route: u64,
+    drop_no_mac: u64,
+    drop_gre: u64,
+    commit_full: u64,
+    commit_idle: u64,
+    commit_ring: u64,
+    commit_residual: u64,
+    committed: u64,
+    drop_ring_stalled: u64,
+}
+
+impl TxStats {
+    fn is_empty(&self) -> bool {
+        self.tx == 0
+            && self.drop_no_route == 0
+            && self.drop_no_mac == 0
+            && self.drop_gre == 0
+            && self.drop_ring_stalled == 0
+    }
+}
+
+impl<U: Umem> TxLoop<U> {
+    pub fn run<T, D, R>(self, receiver: Receiver<T>, mut drop_item: D, mut route_fn: R)
+    where
+        T: TxPacket,
+        D: FnMut(T),
+        R: FnMut(&IpAddr) -> Option<NextHop>,
+    {
+        // How long we sleep waiting to receive packets from the channel.
+
+        const MAX_TIMEOUTS: usize = 1;
+
+        const BATCH_SIZE: usize = 63;
+
+        let TxLoop {
+            cpu_id,
+            src_mac,
+            socket,
+            mut ring,
+            mut completion,
+        } = self;
+
+        // each queue is bound to its own CPU core
+        set_cpu_affinity(None, [crate::cpu_affinity::CpuId::new(cpu_id).unwrap()]).unwrap();
+
+        let umem = socket.umem();
+        let umem_tx_capacity = umem.available();
+        let umem_frame_size = umem.frame_size();
+
+        let mut batched_items = Vec::with_capacity(BATCH_SIZE);
+
+        let mut batched_packets = 0;
+        // How many descriptors are written into the TX ring but not yet committed.
+        let mut written_uncommitted = 0;
+
+        const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+        let mut stats = TxStats::default();
+        let mut last_report = std::time::Instant::now();
+
+        const PARK_TIMEOUT: Duration = Duration::from_micros(100);
+
+        const SPIN_DWELL: Duration = Duration::from_micros(20);
+        const SPIN_REPROBE_EVERY: u32 = 256;
+        let mut park = crossbeam_channel::Select::new();
+        park.recv(&receiver);
+
+        let mut timeouts = 0;
+        let mut spin_dwell = SPIN_DWELL;
+        let mut fruitless: u32 = 0;
+        loop {
+            let mut channel_drained = false;
+            match receiver.try_recv() {
+                Ok(item) => {
+                    batched_packets += item.dst_addrs().as_ref().len();
+                    batched_items.push(item);
+                    timeouts = 0;
+                    if batched_packets < BATCH_SIZE {
+                        continue;
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    channel_drained = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    if batched_packets == 0 {
+                        break;
+                    }
+                }
+            };
+
+            for item in batched_items.drain(..) {
+                let src_addr = item.src_addr();
+                let src_ip = src_addr.ip();
+                let src_port = src_addr.port();
+                let ecn = item.ecn();
+                let can_overflow_mtu = item.allow_mtu_overflow();
+                for addr in item.dst_addrs().as_ref() {
+                    if ring.available() == 0 || umem.available() == 0 {
+                        let pending = written_uncommitted;
+                        commit_pending(&mut ring, &mut written_uncommitted);
+                        if pending > 0 {
+                            stats.commit_ring += 1;
+                            stats.committed += pending as u64;
+                        }
+                        kick(&ring);
+
+                        if !wait_for_ring_slot(&mut ring, &mut completion, umem) {
+                            stats.drop_ring_stalled += 1;
+                            batched_packets -= 1;
+                            continue;
+                        }
+                    }
+
+                    // at this point we're guaranteed to have a frame to write the next packet into and
+                    // a slot in the ring to submit it
+                    let mut frame = umem.reserve().unwrap();
+                    let IpAddr::V4(dst_ip) = addr.ip() else {
+                        panic!("IPv6 not supported");
+                    };
+
+                    let payload = item.payload().as_ref();
+                    let len = payload.len();
+
+                    let dst = addr.ip();
+                    let Some(next_hop) = route_fn(&dst) else {
+                        tracing::warn!("dropping packet: no route for peer {addr}");
+                        stats.drop_no_route += 1;
+                        batched_packets -= 1;
+                        umem.release(frame);
+                        continue;
+                    };
+
+                    if let Some(gre) = &next_hop.gre {
+                        let Some(dest_mac) = gre.underlay_mac_addr else {
+                            tracing::warn!(
+                                "dropping packet: GRE peer {addr} must be routed through {} on \
+                                 if{} which has no known MAC address",
+                                gre.underlay_ip_addr,
+                                gre.underlay_if_index
+                            );
+                            stats.drop_no_mac += 1;
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        };
+
+                        let l3_inner_packet_len = INNER_PACKET_HEADER_SIZE + len;
+                        let l3_outer_gre_packet_len =
+                            IP_HEADER_SIZE + GRE_HEADER_BASE_SIZE + l3_inner_packet_len;
+
+                        if l3_inner_packet_len > gre.mtu as usize
+                            || l3_outer_gre_packet_len > next_hop.mtu as usize
+                        {
+                            if !can_overflow_mtu {
+                                tracing::warn!(
+                                    "dropping packet: GRE payload exceeds MTU for {addr}: L3 \
+                                     inner packet length {l3_inner_packet_len}, L3 outer GRE \
+                                     packet length {l3_outer_gre_packet_len}, MTU: {mtu}, \
+                                     underlay_mtu: {underlay_mtu}.",
+                                    mtu = gre.mtu,
+                                    underlay_mtu = next_hop.mtu
+                                );
+                            }
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        let packet_len = gre_packet_size(len);
+                        if packet_len > umem_frame_size {
+                            tracing::warn!(
+                                "dropping packet: GRE packet size {packet_len} exceeds frame size \
+                                 {umem_frame_size} for {addr}"
+                            );
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        frame.set_len(packet_len);
+                        let mut packet = umem.map_frame_mut(frame);
+                        let inner_src_ip = next_hop.preferred_src_ip.as_ref().unwrap_or(src_ip);
+                        if let Err(err) = construct_gre_packet(
+                            &mut packet,
+                            &src_mac,
+                            &dest_mac,
+                            inner_src_ip,
+                            &dst_ip,
+                            src_port,
+                            addr.port(),
+                            payload,
+                            ecn,
+                            &gre.tunnel_info,
+                        ) {
+                            tracing::warn!("dropping packet: {err}");
+                            stats.drop_gre += 1;
+                            batched_packets -= 1;
+                            umem.release(packet.into_frame());
+                            continue;
+                        }
+                        frame = packet.into_frame();
+                    } else if let Some(vlan) = &next_hop.vlan {
+                        // we need the MAC address to send the packet
+                        let Some(dest_mac) = next_hop.mac_addr else {
+                            tracing::warn!(
+                                "dropping packet: peer {addr} must be routed through {} which has \
+                                 no known MAC address",
+                                next_hop.ip_addr
+                            );
+                            stats.drop_no_mac += 1;
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        };
+
+                        // The 802.1Q tag is added at L2, so the L3 size compared against the MTU
+                        // is the same as the untagged path.
+                        let l3_packet_len = IP_HEADER_SIZE + UDP_HEADER_SIZE + len;
+                        if l3_packet_len > next_hop.mtu as usize {
+                            if !can_overflow_mtu {
+                                tracing::warn!(
+                                    "dropping packet: packet size {l3_packet_len} exceeds MTU \
+                                     {mtu} for {addr}",
+                                    mtu = next_hop.mtu
+                                );
+                            }
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        let packet_len = VLAN_PACKET_HEADER_SIZE + len;
+                        if packet_len > umem_frame_size {
+                            tracing::warn!(
+                                "dropping packet: VLAN packet size {packet_len} exceeds frame \
+                                 size {umem_frame_size} for {addr}"
+                            );
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        frame.set_len(packet_len);
+                        let mut packet = umem.map_frame_mut(frame);
+
+                        // The route's preferred src is the IP assigned to the VLAN sub-interface,
+                        // which is the right inner src for traffic egressing this VLAN. Fall back
+                        // to the device's src IP if the route did not carry one.
+                        let inner_src_ip = next_hop.preferred_src_ip.as_ref().unwrap_or(src_ip);
+
+                        if !construct_vlan_packet(
+                            &mut packet,
+                            &src_mac.0,
+                            &dest_mac.0,
+                            inner_src_ip,
+                            &dst_ip,
+                            src_port,
+                            addr.port(),
+                            vlan.vid,
+                            vlan.pcp,
+                            payload,
+                            ecn,
+                        ) {
+                            tracing::warn!("dropping packet: VLAN frame did not fit in UMEM slot");
+                            batched_packets -= 1;
+                            umem.release(packet.into_frame());
+                            continue;
+                        }
+                        frame = packet.into_frame();
+                    } else {
+                        // we need the MAC address to send the packet
+                        let Some(dest_mac) = next_hop.mac_addr else {
+                            tracing::warn!(
+                                "dropping packet: peer {addr} must be routed through {} which has \
+                                 no known MAC address",
+                                next_hop.ip_addr
+                            );
+                            stats.drop_no_mac += 1;
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        };
+
+                        let l3_packet_len = IP_HEADER_SIZE + UDP_HEADER_SIZE + len;
+                        if l3_packet_len > next_hop.mtu as usize {
+                            if !can_overflow_mtu {
+                                tracing::warn!(
+                                    "dropping packet: packet size {l3_packet_len} exceeds MTU \
+                                     {mtu} for {addr}",
+                                    mtu = next_hop.mtu
+                                );
+                            }
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        let packet_len = PACKET_HEADER_SIZE + len;
+                        if packet_len > umem_frame_size {
+                            tracing::warn!(
+                                "dropping packet: packet size {packet_len} exceeds frame size \
+                                 {umem_frame_size} for {addr}"
+                            );
+                            batched_packets -= 1;
+                            umem.release(frame);
+                            continue;
+                        }
+
+                        frame.set_len(packet_len);
+                        let mut packet = umem.map_frame_mut(frame);
+
+                        if !construct_packet(
+                            &mut packet,
+                            &src_mac.0,
+                            &dest_mac.0,
+                            src_ip,
+                            &dst_ip,
+                            src_port,
+                            addr.port(),
+                            payload,
+                            ecn,
+                        ) {
+                            tracing::warn!("dropping packet: frame did not fit in UMEM slot");
+                            batched_packets -= 1;
+                            umem.release(packet.into_frame());
+                            continue;
+                        }
+                        frame = packet.into_frame();
+                    }
+
+                    ring.write(frame, 0)
+                        .map_err(|_| "ring full")
+                        // this should never happen as we check for available slots above
+                        .expect("failed to write to ring");
+
+                    stats.tx += 1;
+                    batched_packets -= 1;
+                    written_uncommitted += 1;
+
+                    // check if it's time to publish descriptors and kick the driver
+                    if written_uncommitted >= BATCH_SIZE {
+                        stats.commit_full += 1;
+                        stats.committed += written_uncommitted as u64;
+                        commit_pending(&mut ring, &mut written_uncommitted);
+                        kick(&ring);
+                    }
+                }
+                drop_item(item);
+            }
+            debug_assert_eq!(batched_packets, 0);
+
+            let pending = written_uncommitted;
+            commit_pending(&mut ring, &mut written_uncommitted);
+            if pending > 0 {
+                if channel_drained {
+                    stats.commit_idle += 1;
+                } else {
+                    stats.commit_residual += 1;
+                }
+                stats.committed += pending as u64;
+            }
+            if pending > 0 || channel_drained {
+                kick(&ring);
+            }
+
+            if channel_drained {
+                completion.sync(true);
+                ring.sync(false);
+                while let Some(frame_offset) = completion.read() {
+                    umem.release_completed(frame_offset);
+                }
+
+                if spin_dwell.is_zero() {
+                    fruitless = fruitless.wrapping_add(1);
+                    if fruitless.is_multiple_of(SPIN_REPROBE_EVERY) {
+                        spin_dwell = SPIN_DWELL;
+                    }
+                }
+                if !spin_dwell.is_zero() {
+                    let until = std::time::Instant::now().checked_add(spin_dwell);
+                    let mut ticks: u32 = 0;
+                    while receiver.is_empty() {
+                        ticks = ticks.wrapping_add(1);
+                        if ticks & 63 == 0
+                            && until.is_none_or(|until| std::time::Instant::now() >= until)
+                        {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    if receiver.is_empty() {
+                        spin_dwell /= 2;
+                    } else {
+                        spin_dwell = SPIN_DWELL;
+                        fruitless = 0;
+                    }
+                }
+
+                if timeouts < MAX_TIMEOUTS {
+                    timeouts += 1;
+                    let _ = park.ready_timeout(PARK_TIMEOUT);
+                } else {
+                    timeouts = 0;
+                }
+            }
+
+            if last_report.elapsed() >= REPORT_INTERVAL {
+                if !stats.is_empty() {
+                    let publishes = stats
+                        .commit_full
+                        .saturating_add(stats.commit_idle)
+                        .saturating_add(stats.commit_ring)
+                        .saturating_add(stats.commit_residual);
+                    tracing::debug!(
+                        "xdp tx cpu {cpu_id}: sent {} dropped(no_route {} no_mac {} gre {}) \
+                         published {} times (batch_full {} idle {} ring_full {} residual {}), \
+                         ring_stalled_drops {}, {:.1} descriptors per publication",
+                        stats.tx,
+                        stats.drop_no_route,
+                        stats.drop_no_mac,
+                        stats.drop_gre,
+                        publishes,
+                        stats.commit_full,
+                        stats.commit_idle,
+                        stats.commit_ring,
+                        stats.commit_residual,
+                        stats.drop_ring_stalled,
+                        stats.committed as f64 / publishes.max(1) as f64,
+                    );
+                    stats = TxStats::default();
+                }
+                last_report = std::time::Instant::now();
+            }
+        }
+        assert_eq!(batched_packets, 0);
+        commit_pending(&mut ring, &mut written_uncommitted);
+        kick(&ring);
+
+        // drain the ring
+        while umem.available() < umem_tx_capacity || ring.available() < ring.capacity() {
+            tracing::debug!(
+                "draining xdp ring umem {}/{} ring {}/{}",
+                umem.available(),
+                umem_tx_capacity,
+                ring.available(),
+                ring.capacity()
+            );
+
+            completion.sync(true);
+            while let Some(frame_offset) = completion.read() {
+                umem.release_completed(frame_offset);
+            }
+
+            ring.sync(false);
+            kick(&ring);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn wait_for_ring_slot<U: Umem>(
+    ring: &mut TxRing<U::Frame>,
+    completion: &mut TxCompletionRing,
+    umem: &U,
+) -> bool {
+    const RING_STALL_LIMIT: Duration = Duration::from_millis(5);
+    let mut deadline = None;
+    let mut pass: u32 = 0;
+    loop {
+        completion.sync(true);
+        // we haven't written any frames so we only need to sync the consumer position
+        ring.sync(false);
+
+        // check if any frames were completed
+        while let Some(frame_offset) = completion.read() {
+            umem.release_completed(frame_offset);
+        }
+
+        if ring.available() > 0 && umem.available() > 0 {
+            return true;
+        }
+
+        // queues are full, if NEEDS_WAKEUP is set kick the driver so hopefully it'll
+        // complete some work
+        kick(ring);
+
+        pass = pass.wrapping_add(1);
+        if pass.is_multiple_of(64) {
+            let now = std::time::Instant::now();
+            match deadline {
+                None => deadline = Some(now.checked_add(RING_STALL_LIMIT).unwrap_or(now)),
+                Some(deadline) if now >= deadline => return false,
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn commit_pending<F: Frame>(ring: &mut TxRing<F>, pending_uncommitted: &mut usize) {
+    if *pending_uncommitted == 0 {
+        return;
+    }
+    ring.commit();
+    *pending_uncommitted = 0;
+}
+
+// With some drivers, or always when we work in SKB mode, we need to explicitly kick the driver once
+// we want the NIC to do something.
+#[inline(always)]
+fn kick<F: Frame>(ring: &TxRing<F>) {
+    if !ring.needs_wakeup() {
+        return;
+    }
+
+    if let Err(e) = ring.wake() {
+        kick_error(e);
+    }
+}
+
+#[inline(never)]
+fn kick_error(e: std::io::Error) {
+    match e.raw_os_error() {
+        // these are non-fatal errors
+        Some(libc::EBUSY | libc::ENOBUFS | libc::EAGAIN) => {}
+        // this can temporarily happen with some drivers when changing
+        // settings (eg with ethtool)
+        Some(libc::ENETDOWN) => {
+            tracing::warn!("network interface is down")
+        }
+        // we should never get here, hopefully the driver recovers?
+        _ => {
+            tracing::error!("network interface driver error: {e:?}");
+        }
+    }
+}

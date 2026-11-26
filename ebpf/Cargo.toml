@@ -1,0 +1,30 @@
+[package]
+name = "allnodes-xdp-ebpf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# The classifier is Apache-2.0; the dispatcher is GPL-2.0 (see its source header).
+license = "Apache-2.0 AND GPL-2.0-only"
+
+[workspace]
+
+[[bin]]
+name = "allnodes-xdp-classifier"
+path = "src/bin/allnodes-xdp-classifier.rs"
+
+[[bin]]
+name = "allnodes-xdp-dispatcher"
+path = "src/bin/allnodes-xdp-dispatcher.rs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 2
+
+[profile.dev]
+panic = "abort"
